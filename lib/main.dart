@@ -1,35 +1,54 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:dio/dio.dart';
 import 'package:just_audio/just_audio.dart';
+import 'package:audio_service/audio_service.dart';
 import 'package:just_audio_background/just_audio_background.dart';
 import 'package:audio_session/audio_session.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:flutter_overlay_window/flutter_overlay_window.dart';
 
-const Color emerald = Color(0xFF126B50);
-const Color gold = Color(0xFFD7B46A);
+const emerald = Color(0xFF126B50);
+const gold = Color(0xFFD7B46A);
 
-const String apiBase = 'https://api.alquran.cloud/v1';
-const String audioBase =
+const apiBase = 'https://api.alquran.cloud/v1';
+const audioBase =
     'https://cdn.islamic.network/quran/audio-surah/128/ar.alafasy';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
 
-  await JustAudioBackground.init(
-    androidNotificationChannelId: 'com.example.noor_quran.audio',
-    androidNotificationChannelName: 'تلاوات القرآن الكريم',
-    androidNotificationOngoing: true,
-  );
+  // لا نسمح لفشل تهيئة الصوت بمنع ظهور التطبيق.
+  try {
+    await JustAudioBackground.init(
+      androidNotificationChannelId: 'com.example.noor_quran.audio',
+      androidNotificationChannelName: 'تلاوات القرآن الكريم',
+      androidNotificationOngoing: true,
+    ).timeout(const Duration(seconds: 8));
+  } catch (error) {
+    debugPrint('خطأ تهيئة الصوت في الخلفية: $error');
+  }
 
-  final session = await AudioSession.instance;
-  await session.configure(
-    const AudioSessionConfiguration.speech(),
-  );
+  try {
+    final session = await AudioSession.instance.timeout(
+      const Duration(seconds: 5),
+    );
+
+    await session
+        .configure(const AudioSessionConfiguration.speech())
+        .timeout(const Duration(seconds: 5));
+  } catch (error) {
+    debugPrint('خطأ إعداد جلسة الصوت: $error');
+  }
 
   runApp(const NoorQuranApp());
 }
+
+// ============================================================
+// نماذج البيانات
+// ============================================================
 
 class Surah {
   final int number;
@@ -46,12 +65,10 @@ class Surah {
 
   factory Surah.fromJson(Map<String, dynamic> json) {
     return Surah(
-      number: json['number'] as int,
-      name: json['name'] as String? ?? 'سورة',
-      verses: json['numberOfAyahs'] as int? ?? 0,
-      type: json['revelationType'] == 'Medinan'
-          ? 'مدنية'
-          : 'مكية',
+      number: (json['number'] as num?)?.toInt() ?? 0,
+      name: json['name']?.toString() ?? 'سورة',
+      verses: (json['numberOfAyahs'] as num?)?.toInt() ?? 0,
+      type: json['revelationType'] == 'Medinan' ? 'مدنية' : 'مكية',
     );
   }
 }
@@ -60,18 +77,19 @@ class Ayah {
   final int numberInSurah;
   final String text;
 
-  const Ayah({
-    required this.numberInSurah,
-    required this.text,
-  });
+  const Ayah(this.numberInSurah, this.text);
 
   factory Ayah.fromJson(Map<String, dynamic> json) {
     return Ayah(
-      numberInSurah: json['numberInSurah'] as int? ?? 0,
-      text: json['text'] as String? ?? '',
+      (json['numberInSurah'] as num?)?.toInt() ?? 0,
+      json['text']?.toString() ?? '',
     );
   }
 }
+
+// ============================================================
+// واجهة الاتصال بخدمة القرآن
+// ============================================================
 
 class QuranApi {
   static final Dio _dio = Dio(
@@ -79,35 +97,36 @@ class QuranApi {
       baseUrl: apiBase,
       connectTimeout: const Duration(seconds: 15),
       receiveTimeout: const Duration(seconds: 20),
+      sendTimeout: const Duration(seconds: 15),
+      responseType: ResponseType.json,
     ),
   );
 
-  static Future<List<Surah>> getSurahs() async {
+  static Future<List<Surah>> surahs() async {
     final response = await _dio.get('/surah');
-    final data = response.data['data'] as List;
+    final data = response.data['data'] as List<dynamic>;
 
     return data
-        .map((item) => Surah.fromJson(
-              Map<String, dynamic>.from(item as Map),
-            ))
+        .whereType<Map<String, dynamic>>()
+        .map(Surah.fromJson)
         .toList();
   }
 
-  static Future<List<Ayah>> getAyahs(int surahNumber) async {
-    final response =
-        await _dio.get('/surah/$surahNumber/quran-uthmani');
-
-    final data =
-        response.data['data'] as Map<String, dynamic>;
-    final list = data['ayahs'] as List;
+  static Future<List<Ayah>> ayahs(int number) async {
+    final response = await _dio.get('/surah/$number/quran-uthmani');
+    final data = response.data['data'] as Map<String, dynamic>;
+    final list = data['ayahs'] as List<dynamic>;
 
     return list
-        .map((item) => Ayah.fromJson(
-              Map<String, dynamic>.from(item as Map),
-            ))
+        .whereType<Map<String, dynamic>>()
+        .map(Ayah.fromJson)
         .toList();
   }
 }
+
+// ============================================================
+// التطبيق الرئيسي
+// ============================================================
 
 class NoorQuranApp extends StatefulWidget {
   const NoorQuranApp({super.key});
@@ -117,27 +136,102 @@ class NoorQuranApp extends StatefulWidget {
 }
 
 class _NoorQuranAppState extends State<NoorQuranApp> {
-  int selectedTab = 0;
-  bool darkMode = false;
-  int tasbihCount = 0;
-  int khatmaPages = 0;
+  int tab = 0;
+  bool dark = false;
+  bool loading = true;
+  bool overlayBusy = false;
+
+  int tasbih = 0;
+  int pages = 0;
+
+  String? loadError;
+  Surah? currentSurah;
 
   final Set<int> favorites = {};
+  final List<Surah> surahs = [];
   final AudioPlayer player = AudioPlayer();
-  final TextEditingController searchController =
-      TextEditingController();
-
-  List<Surah> surahs = [];
-  bool loading = true;
-  String? errorMessage;
-  Surah? currentSurah;
-  bool overlayBusy = false;
+  final TextEditingController searchController = TextEditingController();
 
   @override
   void initState() {
     super.initState();
-    _loadSavedData();
+    _loadPrefs();
     _loadSurahs();
+  }
+
+  // تحميل الإعدادات دون تعطيل واجهة التطبيق عند حدوث خطأ.
+  Future<void> _loadPrefs() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+
+      if (!mounted) return;
+
+      setState(() {
+        dark = prefs.getBool('dark') ?? false;
+        tasbih = prefs.getInt('tasbih') ?? 0;
+        pages = prefs.getInt('pages') ?? 0;
+
+        favorites
+          ..clear()
+          ..addAll(
+            (prefs.getStringList('favorites') ?? [])
+                .map((value) => int.tryParse(value))
+                .whereType<int>(),
+          );
+      });
+    } catch (error) {
+      debugPrint('تعذر تحميل الإعدادات: $error');
+    }
+  }
+
+  Future<void> _save() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+
+      await prefs.setBool('dark', dark);
+      await prefs.setInt('tasbih', tasbih);
+      await prefs.setInt('pages', pages);
+      await prefs.setStringList(
+        'favorites',
+        favorites.map((value) => value.toString()).toList(),
+      );
+    } catch (error) {
+      debugPrint('تعذر حفظ الإعدادات: $error');
+    }
+  }
+
+  Future<void> _loadSurahs() async {
+    if (mounted) {
+      setState(() {
+        loading = true;
+        loadError = null;
+      });
+    }
+
+    try {
+      final result = await QuranApi.surahs().timeout(
+        const Duration(seconds: 25),
+      );
+
+      if (!mounted) return;
+
+      setState(() {
+        surahs
+          ..clear()
+          ..addAll(result);
+        loading = false;
+        loadError = null;
+      });
+    } catch (error) {
+      debugPrint('تعذر تحميل السور: $error');
+
+      if (!mounted) return;
+
+      setState(() {
+        loading = false;
+        loadError = 'تعذّر تحميل فهرس القرآن. تحقق من الإنترنت وحاول مجددًا.';
+      });
+    }
   }
 
   @override
@@ -147,112 +241,142 @@ class _NoorQuranAppState extends State<NoorQuranApp> {
     super.dispose();
   }
 
-  Future<void> _loadSavedData() async {
-    final prefs = await SharedPreferences.getInstance();
+  // ==========================================================
+  // تشغيل التلاوة
+  // ==========================================================
 
-    if (!mounted) return;
-
-    setState(() {
-      darkMode = prefs.getBool('darkMode') ?? false;
-      tasbihCount = prefs.getInt('tasbihCount') ?? 0;
-      khatmaPages =
-          (prefs.getInt('khatmaPages') ?? 0).clamp(0, 604);
-
-      favorites.addAll(
-        (prefs.getStringList('favorites') ?? [])
-            .map((value) => int.tryParse(value))
-            .whereType<int>(),
-      );
-    });
-  }
-
-  Future<void> _saveData() async {
-    final prefs = await SharedPreferences.getInstance();
-
-    await prefs.setBool('darkMode', darkMode);
-    await prefs.setInt('tasbihCount', tasbihCount);
-    await prefs.setInt('khatmaPages', khatmaPages);
-    await prefs.setStringList(
-      'favorites',
-      favorites.map((number) => number.toString()).toList(),
-    );
-  }
-
-  Future<void> _loadSurahs() async {
+  Future<void> playSurah(Surah surah) async {
     try {
-      final result = await QuranApi.getSurahs();
+      setState(() => currentSurah = surah);
+
+      await player.setAudioSource(
+        AudioSource.uri(
+          Uri.parse('$audioBase/${surah.number}.mp3'),
+          tag: MediaItem(
+            id: '${surah.number}',
+            title: surah.name,
+            album: 'القرآن الكريم',
+            artist: 'مشاري العفاسي',
+          ),
+        ),
+      );
+
+      await player.play();
+    } catch (error) {
+      debugPrint('تعذر تشغيل التلاوة: $error');
 
       if (!mounted) return;
 
-      setState(() {
-        surahs = result;
-        loading = false;
-        errorMessage = null;
-      });
-    } catch (_) {
-      if (!mounted) return;
-
-      setState(() {
-        loading = false;
-        errorMessage =
-            'تعذّر تحميل القرآن. تحقق من اتصال الإنترنت وحاول مجددًا.';
-      });
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('تعذر تشغيل التلاوة. تحقق من الإنترنت وحاول مجددًا.'),
+        ),
+      );
     }
   }
 
-  ThemeData _buildTheme() {
-    return ThemeData(
-      useMaterial3: true,
-      brightness:
-          darkMode ? Brightness.dark : Brightness.light,
-      colorScheme: ColorScheme.fromSeed(
-        seedColor: emerald,
-        brightness:
-            darkMode ? Brightness.dark : Brightness.light,
-      ),
-      scaffoldBackgroundColor: darkMode
-          ? const Color(0xFF101A18)
-          : const Color(0xFFF5F7F2),
-      appBarTheme: const AppBarTheme(
-        centerTitle: false,
-      ),
-      cardTheme: CardThemeData(
-        elevation: 0,
-        shape: RoundedRectangleBorder(
-          borderRadius: BorderRadius.circular(22),
-        ),
-      ),
-    );
+  // ==========================================================
+  // النافذة العائمة للأذكار
+  // ==========================================================
+
+  Future<void> toggleOverlay() async {
+    if (overlayBusy) return;
+
+    setState(() => overlayBusy = true);
+
+    try {
+      bool? allowed =
+          await FlutterOverlayWindow.isPermissionGranted();
+
+      if (allowed != true) {
+        allowed = await FlutterOverlayWindow.requestPermission();
+      }
+
+      if (allowed == true) {
+        await FlutterOverlayWindow.showOverlay(
+          height: 180,
+          width: 280,
+          alignment: OverlayAlignment.centerRight,
+          visibility: NotificationVisibility.visibilityPublic,
+          flag: OverlayFlag.defaultFlag,
+          enableDrag: true,
+          overlayTitle: 'نور القرآن',
+          overlayContent: 'ذكر الله',
+        );
+      } else if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('يرجى السماح بالظهور فوق التطبيقات الأخرى.'),
+          ),
+        );
+      }
+    } on PlatformException catch (error) {
+      debugPrint('خطأ النافذة العائمة: $error');
+
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('تعذر تشغيل النافذة العائمة على هذا الجهاز.'),
+          ),
+        );
+      }
+    } catch (error) {
+      debugPrint('خطأ غير متوقع في النافذة العائمة: $error');
+    } finally {
+      if (mounted) {
+        setState(() => overlayBusy = false);
+      }
+    }
   }
+
+  // ==========================================================
+  // التصميم والثيم
+  // ==========================================================
+
+  ThemeData get theme => ThemeData(
+        useMaterial3: true,
+        brightness: dark ? Brightness.dark : Brightness.light,
+        colorScheme: ColorScheme.fromSeed(
+          seedColor: emerald,
+          brightness: dark ? Brightness.dark : Brightness.light,
+        ),
+        scaffoldBackgroundColor:
+            dark ? const Color(0xFF101A18) : const Color(0xFFF5F7F2),
+        appBarTheme: const AppBarTheme(centerTitle: false),
+        cardTheme: CardThemeData(
+          elevation: 0,
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(22),
+          ),
+        ),
+      );
 
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
       title: 'نور القرآن',
       debugShowCheckedModeBanner: false,
-      theme: _buildTheme(),
-      builder: (context, child) {
-        return Directionality(
-          textDirection: TextDirection.rtl,
-          child: child ?? const SizedBox.shrink(),
-        );
-      },
+      theme: theme,
+      builder: (context, child) => Directionality(
+        textDirection: TextDirection.rtl,
+        child: child ?? const SizedBox.shrink(),
+      ),
       home: Scaffold(
         body: SafeArea(
           child: IndexedStack(
-            index: selectedTab,
+            index: tab,
             children: [
-              _homePage(),
-              _quranPage(),
+              _home(),
+              _quran(),
               _favoritesPage(),
-              _morePage(),
+              _more(),
             ],
           ),
         ),
         bottomNavigationBar: NavigationBar(
-          selectedIndex: selectedTab,
-          onDestinationSelected: (index) {
-            setState(() => selectedTab = index);
+          selectedIndex: tab,
+          onDestinationSelected: (value) {
+            setState(() => tab = value);
           },
           destinations: const [
             NavigationDestination(
@@ -288,7 +412,7 @@ class _NoorQuranAppState extends State<NoorQuranApp> {
     );
   }
 
-  Widget _pageHeading(String title, String subtitle) {
+  Widget _heading(String title, String subtitle) {
     return Padding(
       padding: const EdgeInsets.fromLTRB(20, 20, 20, 14),
       child: Column(
@@ -305,9 +429,7 @@ class _NoorQuranAppState extends State<NoorQuranApp> {
           Text(
             subtitle,
             style: TextStyle(
-              color: Theme.of(context)
-                  .colorScheme
-                  .onSurfaceVariant,
+              color: Theme.of(context).colorScheme.onSurfaceVariant,
             ),
           ),
         ],
@@ -315,14 +437,15 @@ class _NoorQuranAppState extends State<NoorQuranApp> {
     );
   }
 
-  Widget _homePage() {
+  // ==========================================================
+  // الرئيسية
+  // ==========================================================
+
+  Widget _home() {
     return ListView(
       padding: const EdgeInsets.only(bottom: 28),
       children: [
-        _pageHeading(
-          'نور القرآن',
-          'رفيقك اليومي لكتاب الله',
-        ),
+        _heading('نور القرآن', 'رفيقك اليومي لكتاب الله'),
         Padding(
           padding: const EdgeInsets.symmetric(horizontal: 16),
           child: Container(
@@ -330,10 +453,7 @@ class _NoorQuranAppState extends State<NoorQuranApp> {
             decoration: BoxDecoration(
               borderRadius: BorderRadius.circular(28),
               gradient: const LinearGradient(
-                colors: [
-                  Color(0xFF0D5943),
-                  Color(0xFF238568),
-                ],
+                colors: [Color(0xFF0D5943), Color(0xFF238568)],
                 begin: Alignment.topRight,
                 end: Alignment.bottomLeft,
               ),
@@ -341,11 +461,7 @@ class _NoorQuranAppState extends State<NoorQuranApp> {
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                const Icon(
-                  Icons.auto_awesome,
-                  color: gold,
-                  size: 32,
-                ),
+                const Icon(Icons.auto_awesome, color: gold, size: 32),
                 const SizedBox(height: 14),
                 const Text(
                   'وَلَقَدْ يَسَّرْنَا الْقُرْآنَ لِلذِّكْرِ',
@@ -358,10 +474,7 @@ class _NoorQuranAppState extends State<NoorQuranApp> {
                 ),
                 const Text(
                   'فَهَلْ مِن مُّدَّكِرٍ',
-                  style: TextStyle(
-                    color: gold,
-                    fontSize: 19,
-                  ),
+                  style: TextStyle(color: gold, fontSize: 19),
                 ),
                 const SizedBox(height: 6),
                 const Text(
@@ -374,9 +487,7 @@ class _NoorQuranAppState extends State<NoorQuranApp> {
                     backgroundColor: gold,
                     foregroundColor: Colors.black87,
                   ),
-                  onPressed: () {
-                    setState(() => selectedTab = 1);
-                  },
+                  onPressed: () => setState(() => tab = 1),
                   child: const Text('افتح المصحف'),
                 ),
               ],
@@ -388,29 +499,11 @@ class _NoorQuranAppState extends State<NoorQuranApp> {
           padding: const EdgeInsets.symmetric(horizontal: 16),
           child: Row(
             children: [
-              Expanded(
-                child: _statCard(
-                  Icons.menu_book,
-                  '$khatmaPages / 604',
-                  'صفحة الختمة',
-                ),
-              ),
+              Expanded(child: _stat(Icons.menu_book, '$pages / 604', 'صفحة الختمة')),
               const SizedBox(width: 10),
-              Expanded(
-                child: _statCard(
-                  Icons.favorite,
-                  '${favorites.length}',
-                  'سور مفضلة',
-                ),
-              ),
+              Expanded(child: _stat(Icons.favorite, '${favorites.length}', 'سور مفضلة')),
               const SizedBox(width: 10),
-              Expanded(
-                child: _statCard(
-                  Icons.fingerprint,
-                  '$tasbihCount',
-                  'تسبيحة',
-                ),
-              ),
+              Expanded(child: _stat(Icons.fingerprint, '$tasbih', 'تسبيحة')),
             ],
           ),
         ),
@@ -429,39 +522,38 @@ class _NoorQuranAppState extends State<NoorQuranApp> {
         Padding(
           padding: const EdgeInsets.symmetric(horizontal: 16),
           child: GridView.count(
-            crossAxisCount:
-                MediaQuery.sizeOf(context).width > 600 ? 4 : 2,
+            crossAxisCount: MediaQuery.sizeOf(context).width > 600 ? 4 : 2,
             shrinkWrap: true,
             physics: const NeverScrollableScrollPhysics(),
             crossAxisSpacing: 12,
             mainAxisSpacing: 12,
             childAspectRatio: 1.3,
             children: [
-              _toolCard(
+              _tool(
                 Icons.fingerprint,
                 'المسبحة',
-                'عداد التسبيح',
-                _showTasbih,
+                'عداد محفوظ',
+                _tasbihDialog,
               ),
-              _toolCard(
+              _tool(
                 Icons.track_changes,
                 'ختمة القرآن',
-                'متابعة الإنجاز',
-                _showKhatma,
+                'تقدم القراءة',
+                _khatmaDialog,
               ),
-              _toolCard(
+              _tool(
                 Icons.layers_outlined,
-                'الذكر العائم',
-                'فوق التطبيقات',
-                _toggleOverlay,
+                'ذكر عائم',
+                'يظهر فوق التطبيقات',
+                toggleOverlay,
               ),
-              _toolCard(
+              _tool(
                 Icons.nights_stay_outlined,
                 'الوضع الليلي',
-                'تغيير المظهر',
+                'تبديل المظهر',
                 () async {
-                  setState(() => darkMode = !darkMode);
-                  await _saveData();
+                  setState(() => dark = !dark);
+                  await _save();
                 },
               ),
             ],
@@ -472,11 +564,7 @@ class _NoorQuranAppState extends State<NoorQuranApp> {
     );
   }
 
-  Widget _statCard(
-    IconData icon,
-    String value,
-    String label,
-  ) {
+  Widget _stat(IconData icon, String value, String label) {
     return Card(
       child: Padding(
         padding: const EdgeInsets.all(12),
@@ -492,17 +580,14 @@ class _NoorQuranAppState extends State<NoorQuranApp> {
                 fontSize: 17,
               ),
             ),
-            Text(
-              label,
-              style: const TextStyle(fontSize: 11),
-            ),
+            Text(label, style: const TextStyle(fontSize: 11)),
           ],
         ),
       ),
     );
   }
 
-  Widget _toolCard(
+  Widget _tool(
     IconData icon,
     String title,
     String subtitle,
@@ -522,14 +607,9 @@ class _NoorQuranAppState extends State<NoorQuranApp> {
               const SizedBox(height: 9),
               Text(
                 title,
-                style: const TextStyle(
-                  fontWeight: FontWeight.bold,
-                ),
+                style: const TextStyle(fontWeight: FontWeight.bold),
               ),
-              Text(
-                subtitle,
-                style: const TextStyle(fontSize: 12),
-              ),
+              Text(subtitle, style: const TextStyle(fontSize: 12)),
             ],
           ),
         ),
@@ -537,7 +617,11 @@ class _NoorQuranAppState extends State<NoorQuranApp> {
     );
   }
 
-  Widget _quranPage() {
+  // ==========================================================
+  // فهرس القرآن
+  // ==========================================================
+
+  Widget _quran() {
     final query = searchController.text.trim();
 
     final filtered = surahs.where((surah) {
@@ -547,10 +631,7 @@ class _NoorQuranAppState extends State<NoorQuranApp> {
 
     return Column(
       children: [
-        _pageHeading(
-          'المصحف الشريف',
-          'اختر سورة للقراءة أو الاستماع',
-        ),
+        _heading('المصحف الشريف', 'اختر سورة للقراءة أو الاستماع'),
         Padding(
           padding: const EdgeInsets.symmetric(horizontal: 16),
           child: TextField(
@@ -570,38 +651,25 @@ class _NoorQuranAppState extends State<NoorQuranApp> {
         const SizedBox(height: 8),
         Expanded(
           child: loading
-              ? const Center(
-                  child: CircularProgressIndicator(),
-                )
-              : errorMessage != null
+              ? const Center(child: CircularProgressIndicator())
+              : loadError != null
                   ? Center(
-                      child: Padding(
-                        padding: const EdgeInsets.all(20),
-                        child: Column(
-                          mainAxisSize: MainAxisSize.min,
-                          children: [
-                            const Icon(
-                              Icons.cloud_off,
-                              size: 48,
-                            ),
-                            const SizedBox(height: 12),
-                            Text(
-                              errorMessage!,
+                      child: Column(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          const Icon(Icons.cloud_off, size: 48),
+                          Padding(
+                            padding: const EdgeInsets.all(16),
+                            child: Text(
+                              loadError!,
                               textAlign: TextAlign.center,
                             ),
-                            const SizedBox(height: 12),
-                            FilledButton(
-                              onPressed: () {
-                                setState(() {
-                                  loading = true;
-                                  errorMessage = null;
-                                });
-                                _loadSurahs();
-                              },
-                              child: const Text('إعادة المحاولة'),
-                            ),
-                          ],
-                        ),
+                          ),
+                          FilledButton(
+                            onPressed: _loadSurahs,
+                            child: const Text('إعادة المحاولة'),
+                          ),
+                        ],
                       ),
                     )
                   : ListView.builder(
@@ -618,8 +686,7 @@ class _NoorQuranAppState extends State<NoorQuranApp> {
                           ),
                           child: ListTile(
                             leading: CircleAvatar(
-                              backgroundColor:
-                                  emerald.withValues(alpha: 0.12),
+                              backgroundColor: emerald.withValues(alpha: 0.12),
                               child: Text(
                                 '${surah.number}',
                                 style: const TextStyle(
@@ -642,10 +709,8 @@ class _NoorQuranAppState extends State<NoorQuranApp> {
                               children: [
                                 IconButton(
                                   tooltip: 'استماع',
-                                  onPressed: () => _playSurah(surah),
-                                  icon: const Icon(
-                                    Icons.play_circle_outline,
-                                  ),
+                                  onPressed: () => playSurah(surah),
+                                  icon: const Icon(Icons.play_circle_outline),
                                 ),
                                 IconButton(
                                   tooltip: 'المفضلة',
@@ -657,7 +722,7 @@ class _NoorQuranAppState extends State<NoorQuranApp> {
                                         favorites.add(surah.number);
                                       }
                                     });
-                                    await _saveData();
+                                    await _save();
                                   },
                                   icon: Icon(
                                     isFavorite
@@ -674,7 +739,7 @@ class _NoorQuranAppState extends State<NoorQuranApp> {
                                 MaterialPageRoute(
                                   builder: (_) => ReaderScreen(
                                     surah: surah,
-                                    onPlay: () => _playSurah(surah),
+                                    onPlay: () => playSurah(surah),
                                   ),
                                 ),
                               );
@@ -688,35 +753,23 @@ class _NoorQuranAppState extends State<NoorQuranApp> {
     );
   }
 
+  // ==========================================================
+  // المفضلة
+  // ==========================================================
+
   Widget _favoritesPage() {
-    final saved = surahs
+    final list = surahs
         .where((surah) => favorites.contains(surah.number))
         .toList();
 
     return Column(
       children: [
-        _pageHeading(
-          'السور المفضلة',
-          'سورك المحفوظة للوصول السريع',
-        ),
+        _heading('السور المفضلة', 'سورك المحفوظة للوصول السريع'),
         Expanded(
-          child: saved.isEmpty
-              ? const Center(
-                  child: Column(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      Icon(
-                        Icons.favorite_border,
-                        size: 58,
-                        color: emerald,
-                      ),
-                      SizedBox(height: 12),
-                      Text('لا توجد سور مفضلة بعد'),
-                    ],
-                  ),
-                )
+          child: list.isEmpty
+              ? const Center(child: Text('لا توجد سور مفضلة بعد'))
               : ListView(
-                  children: saved.map((surah) {
+                  children: list.map((surah) {
                     return Card(
                       margin: const EdgeInsets.symmetric(
                         horizontal: 16,
@@ -727,7 +780,7 @@ class _NoorQuranAppState extends State<NoorQuranApp> {
                         subtitle: Text('${surah.verses} آية'),
                         trailing: IconButton(
                           icon: const Icon(Icons.play_arrow),
-                          onPressed: () => _playSurah(surah),
+                          onPressed: () => playSurah(surah),
                         ),
                         onTap: () {
                           Navigator.push(
@@ -735,7 +788,7 @@ class _NoorQuranAppState extends State<NoorQuranApp> {
                             MaterialPageRoute(
                               builder: (_) => ReaderScreen(
                                 surah: surah,
-                                onPlay: () => _playSurah(surah),
+                                onPlay: () => playSurah(surah),
                               ),
                             ),
                           );
@@ -749,24 +802,22 @@ class _NoorQuranAppState extends State<NoorQuranApp> {
     );
   }
 
-  Widget _morePage() {
+  // ==========================================================
+  // المزيد والإعدادات
+  // ==========================================================
+
+  Widget _more() {
     return ListView(
       children: [
-        _pageHeading(
-          'المزيد',
-          'إعدادات وأدوات نور القرآن',
-        ),
+        _heading('المزيد', 'إعدادات وأدوات نور القرآن'),
         Card(
           child: SwitchListTile(
-            secondary: const Icon(
-              Icons.dark_mode_outlined,
-              color: emerald,
-            ),
+            secondary: const Icon(Icons.dark_mode_outlined, color: emerald),
             title: const Text('الوضع الليلي'),
-            value: darkMode,
+            value: dark,
             onChanged: (value) async {
-              setState(() => darkMode = value);
-              await _saveData();
+              setState(() => dark = value);
+              await _save();
             },
           ),
         ),
@@ -774,135 +825,41 @@ class _NoorQuranAppState extends State<NoorQuranApp> {
           child: ListTile(
             leading: const Icon(Icons.layers, color: emerald),
             title: const Text('تشغيل الذكر العائم'),
-            subtitle: const Text(
-              'يتطلب إذن الظهور فوق التطبيقات',
-            ),
+            subtitle: const Text('يحتاج إذن الظهور فوق التطبيقات'),
             trailing: const Icon(Icons.chevron_left),
-            onTap: _toggleOverlay,
+            onTap: toggleOverlay,
           ),
         ),
         Card(
           child: ListTile(
-            leading: const Icon(
-              Icons.fingerprint,
-              color: emerald,
-            ),
+            leading: const Icon(Icons.fingerprint, color: emerald),
             title: const Text('المسبحة الإلكترونية'),
-            onTap: _showTasbih,
+            onTap: _tasbihDialog,
           ),
         ),
         Card(
           child: ListTile(
-            leading: const Icon(
-              Icons.track_changes,
-              color: emerald,
-            ),
+            leading: const Icon(Icons.track_changes, color: emerald),
             title: const Text('خطة ختم القرآن'),
-            onTap: _showKhatma,
+            onTap: _khatmaDialog,
           ),
         ),
         const Card(
           child: ListTile(
             leading: Icon(Icons.info_outline, color: emerald),
             title: Text('مصدر القرآن'),
-            subtitle: Text('AlQuran Cloud API'),
+            subtitle: Text('AlQuran Cloud API — يتطلب اتصال إنترنت'),
           ),
         ),
       ],
     );
   }
 
-  Future<void> _playSurah(Surah surah) async {
-    try {
-      setState(() => currentSurah = surah);
+  // ==========================================================
+  // المسبحة الإلكترونية
+  // ==========================================================
 
-      await player.setAudioSource(
-        AudioSource.uri(
-          Uri.parse('$audioBase/${surah.number}.mp3'),
-          tag: MediaItem(
-            id: '${surah.number}',
-            title: surah.name,
-            album: 'القرآن الكريم',
-            artist: 'مشاري العفاسي',
-          ),
-        ),
-      );
-
-      await player.play();
-    } catch (_) {
-      if (!mounted) return;
-
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-          content: Text(
-            'تعذّر تشغيل التلاوة. تحقق من الاتصال أو جرّب لاحقًا.',
-          ),
-        ),
-      );
-    }
-  }
-
-  Future<void> _toggleOverlay() async {
-    if (overlayBusy) return;
-
-    setState(() => overlayBusy = true);
-
-    try {
-      final allowed =
-          await FlutterOverlayWindow.isPermissionGranted();
-
-      if (allowed != true) {
-        final granted =
-            await FlutterOverlayWindow.requestPermission();
-
-        if (granted != true) {
-          if (mounted) {
-            ScaffoldMessenger.of(context).showSnackBar(
-              const SnackBar(
-                content: Text(
-                  'يجب السماح بالظهور فوق التطبيقات من إعدادات أندرويد.',
-                ),
-              ),
-            );
-          }
-          return;
-        }
-      }
-
-      await FlutterOverlayWindow.showOverlay(
-        height: 180,
-        width: 280,
-        alignment: OverlayAlignment.centerRight,
-        visibility: NotificationVisibility.visibilityPublic,
-        flag: OverlayFlag.defaultFlag,
-        enableDrag: true,
-        overlayTitle: 'نور القرآن',
-        overlayContent: 'ذكر الله',
-      );
-    } on PlatformException {
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(
-            content: Text('تعذّر تشغيل النافذة العائمة على هذا الجهاز.'),
-          ),
-        );
-      }
-    } catch (_) {
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(
-            content: Text(
-              'تعذّر تشغيل النافذة. راجع إعدادات أندرويد والمكتبة.',
-            ),
-          ),
-        );
-      }
-    } finally {
-      if (mounted) setState(() => overlayBusy = false);
-    }
-  }
-
-  void _showTasbih() {
+  void _tasbihDialog() {
     showDialog<void>(
       context: context,
       builder: (dialogContext) {
@@ -915,14 +872,11 @@ class _NoorQuranAppState extends State<NoorQuranApp> {
                 children: [
                   const Text(
                     'سُبْحَانَ اللَّهِ',
-                    style: TextStyle(
-                      fontSize: 24,
-                      color: emerald,
-                    ),
+                    style: TextStyle(fontSize: 24, color: emerald),
                   ),
                   const SizedBox(height: 12),
                   Text(
-                    '$tasbihCount',
+                    '$tasbih',
                     style: const TextStyle(
                       fontSize: 48,
                       fontWeight: FontWeight.bold,
@@ -930,18 +884,18 @@ class _NoorQuranAppState extends State<NoorQuranApp> {
                   ),
                   FilledButton.icon(
                     onPressed: () async {
-                      setState(() => tasbihCount++);
+                      setState(() => tasbih++);
                       updateDialog(() {});
-                      await _saveData();
+                      await _save();
                     },
                     icon: const Icon(Icons.add),
                     label: const Text('تسبيحة'),
                   ),
                   TextButton(
                     onPressed: () async {
-                      setState(() => tasbihCount = 0);
+                      setState(() => tasbih = 0);
                       updateDialog(() {});
-                      await _saveData();
+                      await _save();
                     },
                     child: const Text('تصفير العداد'),
                   ),
@@ -960,56 +914,57 @@ class _NoorQuranAppState extends State<NoorQuranApp> {
     );
   }
 
-  void _showKhatma() {
+  // ==========================================================
+  // خطة الختمة
+  // ==========================================================
+
+  void _khatmaDialog() {
     showDialog<void>(
       context: context,
       builder: (dialogContext) {
         return StatefulBuilder(
           builder: (context, updateDialog) {
-            final progress = khatmaPages / 604;
-
             return AlertDialog(
               title: const Text('خطة ختم القرآن'),
               content: Column(
                 mainAxisSize: MainAxisSize.min,
                 children: [
                   Text(
-                    '$khatmaPages من 604 صفحة',
+                    '$pages من 604 صفحة',
                     style: const TextStyle(
                       fontSize: 20,
                       fontWeight: FontWeight.bold,
                     ),
                   ),
-                  const SizedBox(height: 12),
-                  LinearProgressIndicator(value: progress),
-                  const SizedBox(height: 12),
-                  Text(
-                    '${(progress * 100).toStringAsFixed(1)}% مكتمل',
-                  ),
+                  LinearProgressIndicator(value: pages / 604),
+                  const SizedBox(height: 15),
                   Row(
                     mainAxisAlignment: MainAxisAlignment.center,
                     children: [
                       IconButton(
-                        onPressed: khatmaPages > 0
+                        onPressed: pages > 0
                             ? () async {
-                                setState(() => khatmaPages--);
+                                setState(() => pages--);
                                 updateDialog(() {});
-                                await _saveData();
+                                await _save();
                               }
                             : null,
                         icon: const Icon(Icons.remove),
                       ),
                       IconButton(
-                        onPressed: khatmaPages < 604
+                        onPressed: pages < 604
                             ? () async {
-                                setState(() => khatmaPages++);
+                                setState(() => pages++);
                                 updateDialog(() {});
-                                await _saveData();
+                                await _save();
                               }
                             : null,
                         icon: const Icon(Icons.add),
                       ),
                     ],
+                  ),
+                  Text(
+                    '${(pages / 604 * 100).toStringAsFixed(1)}% مكتمل',
                   ),
                 ],
               ),
@@ -1026,37 +981,40 @@ class _NoorQuranAppState extends State<NoorQuranApp> {
     );
   }
 
+  // ==========================================================
+  // مشغل مصغر
+  // ==========================================================
+
   Widget _miniPlayer() {
     return Card(
       margin: const EdgeInsets.all(16),
       child: ListTile(
-        leading: const Icon(
-          Icons.graphic_eq,
-          color: emerald,
-        ),
-        title: Text(currentSurah?.name ?? 'التلاوة'),
-        subtitle: const Text('مشغل القرآن الكريم'),
-        trailing: StreamBuilder<PlayerState>(
-          stream: player.playerStateStream,
-          builder: (context, snapshot) {
-            final playing = snapshot.data?.playing ?? false;
-
-            return IconButton(
-              onPressed: () {
-                if (playing) {
-                  player.pause();
-                } else {
-                  player.play();
-                }
-              },
-              icon: Icon(
-                playing
+        leading: const Icon(Icons.graphic_eq, color: emerald),
+        title: Text(currentSurah!.name),
+        subtitle: const Text('مشغل التلاوة'),
+        trailing: IconButton(
+          onPressed: () async {
+            try {
+              if (player.playing) {
+                await player.pause();
+              } else {
+                await player.play();
+              }
+            } catch (error) {
+              debugPrint('خطأ المشغل: $error');
+            }
+          },
+          icon: StreamBuilder<PlayerState>(
+            stream: player.playerStateStream,
+            builder: (_, snapshot) {
+              return Icon(
+                snapshot.data?.playing == true
                     ? Icons.pause_circle
                     : Icons.play_circle,
                 size: 34,
-              ),
-            );
-          },
+              );
+            },
+          ),
         ),
         onTap: () => _showPlayer(context),
       ),
@@ -1074,16 +1032,10 @@ class _NoorQuranAppState extends State<NoorQuranApp> {
             child: StreamBuilder<PlayerState>(
               stream: player.playerStateStream,
               builder: (context, snapshot) {
-                final playing = snapshot.data?.playing ?? false;
-
                 return Column(
                   mainAxisSize: MainAxisSize.min,
                   children: [
-                    const Icon(
-                      Icons.menu_book,
-                      color: emerald,
-                      size: 42,
-                    ),
+                    const Icon(Icons.menu_book, color: emerald, size: 40),
                     const SizedBox(height: 8),
                     Text(
                       currentSurah?.name ?? 'التلاوة',
@@ -1092,19 +1044,15 @@ class _NoorQuranAppState extends State<NoorQuranApp> {
                         fontWeight: FontWeight.bold,
                       ),
                     ),
-                    const Text(
-                      'القرآن الكريم · بث عبر الإنترنت',
-                    ),
-                    const SizedBox(height: 18),
+                    const Text('مشاري العفاسي · بث عبر الإنترنت'),
                     StreamBuilder<Duration?>(
                       stream: player.durationStream,
-                      builder: (context, durationSnapshot) {
-                        final total =
-                            durationSnapshot.data ?? Duration.zero;
-
+                      builder: (_, durationSnapshot) {
                         return StreamBuilder<Duration>(
                           stream: player.positionStream,
-                          builder: (context, positionSnapshot) {
+                          builder: (_, positionSnapshot) {
+                            final total =
+                                durationSnapshot.data ?? Duration.zero;
                             final position =
                                 positionSnapshot.data ?? Duration.zero;
 
@@ -1112,21 +1060,22 @@ class _NoorQuranAppState extends State<NoorQuranApp> {
                                 ? total.inMilliseconds.toDouble()
                                 : 1.0;
 
-                            final currentValue = position
-                                .inMilliseconds
-                                .clamp(0, maxValue.toInt())
+                            final value = position.inMilliseconds
+                                .clamp(0, total.inMilliseconds > 0
+                                    ? total.inMilliseconds
+                                    : 0)
                                 .toDouble();
 
                             return Column(
                               children: [
                                 Slider(
-                                  value: currentValue,
+                                  value: value.clamp(0.0, maxValue),
                                   max: maxValue,
                                   onChanged: total.inMilliseconds > 0
-                                      ? (value) {
+                                      ? (newValue) {
                                           player.seek(
                                             Duration(
-                                              milliseconds: value.round(),
+                                              milliseconds: newValue.round(),
                                             ),
                                           );
                                         }
@@ -1136,8 +1085,8 @@ class _NoorQuranAppState extends State<NoorQuranApp> {
                                   mainAxisAlignment:
                                       MainAxisAlignment.spaceBetween,
                                   children: [
-                                    Text(_formatDuration(position)),
-                                    Text(_formatDuration(total)),
+                                    Text(_fmt(position)),
+                                    Text(_fmt(total)),
                                   ],
                                 ),
                               ],
@@ -1154,15 +1103,21 @@ class _NoorQuranAppState extends State<NoorQuranApp> {
                           icon: const Icon(Icons.replay),
                         ),
                         IconButton.filled(
-                          onPressed: () {
-                            if (playing) {
-                              player.pause();
-                            } else {
-                              player.play();
+                          onPressed: () async {
+                            try {
+                              if (player.playing) {
+                                await player.pause();
+                              } else {
+                                await player.play();
+                              }
+                            } catch (error) {
+                              debugPrint('خطأ تشغيل الصوت: $error');
                             }
                           },
                           icon: Icon(
-                            playing ? Icons.pause : Icons.play_arrow,
+                            snapshot.data?.playing == true
+                                ? Icons.pause
+                                : Icons.play_arrow,
                           ),
                         ),
                         IconButton(
@@ -1181,15 +1136,16 @@ class _NoorQuranAppState extends State<NoorQuranApp> {
     );
   }
 
-  String _formatDuration(Duration duration) {
-    final minutes =
-        duration.inMinutes.remainder(60).toString().padLeft(2, '0');
-    final seconds =
-        duration.inSeconds.remainder(60).toString().padLeft(2, '0');
-
+  String _fmt(Duration duration) {
+    final minutes = duration.inMinutes.remainder(60).toString().padLeft(2, '0');
+    final seconds = duration.inSeconds.remainder(60).toString().padLeft(2, '0');
     return '$minutes:$seconds';
   }
 }
+
+// ============================================================
+// شاشة قراءة السورة
+// ============================================================
 
 class ReaderScreen extends StatefulWidget {
   final Surah surah;
@@ -1212,7 +1168,7 @@ class _ReaderScreenState extends State<ReaderScreen> {
   @override
   void initState() {
     super.initState();
-    future = QuranApi.getAyahs(widget.surah.number);
+    future = QuranApi.ayahs(widget.surah.number);
   }
 
   @override
@@ -1225,7 +1181,7 @@ class _ReaderScreenState extends State<ReaderScreen> {
             tooltip: 'تصغير الخط',
             onPressed: () {
               setState(() {
-                fontSize = (fontSize - 2).clamp(18, 42).toDouble();
+                fontSize = (fontSize - 2).clamp(18.0, 42.0).toDouble();
               });
             },
             icon: const Icon(Icons.text_decrease),
@@ -1234,13 +1190,13 @@ class _ReaderScreenState extends State<ReaderScreen> {
             tooltip: 'تكبير الخط',
             onPressed: () {
               setState(() {
-                fontSize = (fontSize + 2).clamp(18, 42).toDouble();
+                fontSize = (fontSize + 2).clamp(18.0, 42.0).toDouble();
               });
             },
             icon: const Icon(Icons.text_increase),
           ),
           IconButton(
-            tooltip: 'استماع',
+            tooltip: 'استماع للسورة',
             onPressed: widget.onPlay,
             icon: const Icon(Icons.play_circle_outline),
           ),
@@ -1250,9 +1206,7 @@ class _ReaderScreenState extends State<ReaderScreen> {
         future: future,
         builder: (context, snapshot) {
           if (snapshot.connectionState != ConnectionState.done) {
-            return const Center(
-              child: CircularProgressIndicator(),
-            );
+            return const Center(child: CircularProgressIndicator());
           }
 
           if (snapshot.hasError || !snapshot.hasData) {
@@ -1260,15 +1214,11 @@ class _ReaderScreenState extends State<ReaderScreen> {
               child: Column(
                 mainAxisSize: MainAxisSize.min,
                 children: [
-                  const Text(
-                    'تعذّر تحميل الآيات. تحقق من الإنترنت.',
-                  ),
-                  const SizedBox(height: 12),
+                  const Text('تعذر تحميل الآيات. تحقق من اتصال الإنترنت.'),
                   FilledButton(
                     onPressed: () {
                       setState(() {
-                        future =
-                            QuranApi.getAyahs(widget.surah.number);
+                        future = QuranApi.ayahs(widget.surah.number);
                       });
                     },
                     child: const Text('إعادة المحاولة'),
@@ -1288,10 +1238,7 @@ class _ReaderScreenState extends State<ReaderScreen> {
                 decoration: BoxDecoration(
                   borderRadius: BorderRadius.circular(24),
                   gradient: const LinearGradient(
-                    colors: [
-                      Color(0xFF0D5943),
-                      Color(0xFF238568),
-                    ],
+                    colors: [Color(0xFF0D5943), Color(0xFF238568)],
                   ),
                 ),
                 child: Column(
@@ -1304,17 +1251,23 @@ class _ReaderScreenState extends State<ReaderScreen> {
                         fontWeight: FontWeight.bold,
                       ),
                     ),
-                    const SizedBox(height: 6),
                     Text(
                       '${widget.surah.type} · ${widget.surah.verses} آية',
-                      style: const TextStyle(
-                        color: Colors.white70,
-                      ),
+                      style: const TextStyle(color: Colors.white70),
                     ),
                   ],
                 ),
               ),
-              const SizedBox(height: 18),
+              if (widget.surah.number != 1 && widget.surah.number != 9)
+                const Padding(
+                  padding: EdgeInsets.symmetric(vertical: 22),
+                  child: Text(
+                    'بِسْمِ اللَّهِ الرَّحْمَٰنِ الرَّحِيمِ',
+                    textAlign: TextAlign.center,
+                    style: TextStyle(fontSize: 25, color: emerald),
+                  ),
+                ),
+              const SizedBox(height: 16),
               Card(
                 child: Padding(
                   padding: const EdgeInsets.all(20),
@@ -1336,8 +1289,7 @@ class _ReaderScreenState extends State<ReaderScreen> {
               const Padding(
                 padding: EdgeInsets.all(12),
                 child: Text(
-                  'النص محمّل من AlQuran Cloud API بالرسم العثماني. '
-                  'راجع المصدر المعتمد قبل نشر التطبيق.',
+                  'النص محمّل من AlQuran Cloud. يُستحسن مراجعة المصدر قبل اعتماد أي طبعة خاصة.',
                   textAlign: TextAlign.center,
                   style: TextStyle(fontSize: 11),
                 ),
@@ -1349,6 +1301,10 @@ class _ReaderScreenState extends State<ReaderScreen> {
     );
   }
 }
+
+// ============================================================
+// نقطة تشغيل النافذة العائمة
+// ============================================================
 
 @pragma('vm:entry-point')
 void overlayMain() {
@@ -1397,11 +1353,7 @@ class _DhikrOverlayState extends State<DhikrOverlay> {
           children: [
             Row(
               children: [
-                const Icon(
-                  Icons.auto_awesome,
-                  color: gold,
-                  size: 18,
-                ),
+                const Icon(Icons.auto_awesome, color: gold, size: 18),
                 const SizedBox(width: 6),
                 const Expanded(
                   child: Text(
@@ -1455,19 +1407,13 @@ class _DhikrOverlayState extends State<DhikrOverlay> {
                     const SizedBox(height: 4),
                     Text(
                       'عدد التسبيحات: $count',
-                      style: const TextStyle(
-                        color: gold,
-                        fontSize: 13,
-                      ),
+                      style: const TextStyle(color: gold, fontSize: 13),
                     ),
                     const SizedBox(height: 4),
                     const Text(
                       'اضغط للعد · ضغط مطوّل لتغيير الذكر',
                       textAlign: TextAlign.center,
-                      style: TextStyle(
-                        color: Colors.white60,
-                        fontSize: 9,
-                      ),
+                      style: TextStyle(color: Colors.white60, fontSize: 9),
                     ),
                   ],
                 ),
